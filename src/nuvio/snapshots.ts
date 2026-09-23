@@ -1,0 +1,805 @@
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  openSync,
+  closeSync,
+  fsyncSync,
+  statSync,
+} from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { join, resolve, sep } from 'node:path';
+import type { NuvioConfig } from '../config.js';
+import type { NuvioClient } from './client.js';
+import { NuvioError } from './errors.js';
+import { readAllLibrary, readAllWatchHistory, readAllWatchProgress } from './ops/readers.js';
+import { historyKeyOf, libraryKeyOf, storedProgressKey } from './keys.js';
+
+/** Thrown when a mandatory pre-mutation snapshot cannot be persisted. */
+export class SnapshotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SnapshotError';
+  }
+}
+
+/**
+ * Identifies the slice of account state a mutation touched. `before` snapshots are
+ * captured in exactly the shape `restore` needs to push back.
+ */
+export type ResourceRef =
+  | { kind: 'profiles' }
+  | { kind: 'addons'; profile_id: number }
+  | { kind: 'plugins'; profile_id: number }
+  | { kind: 'settings'; profile_id: number; platform: string }
+  | { kind: 'home_catalog_settings'; profile_id: number; platform: string }
+  | { kind: 'collections'; profile_id: number }
+  | { kind: 'library'; profile_id: number }
+  | { kind: 'watch_progress'; profile_id: number }
+  | { kind: 'watch_history'; profile_id: number }
+  | { kind: 'provider_credentials'; profile_id: number }
+  | { kind: 'tracker_tokens'; profile_id: number }
+  | { kind: 'tracker_settings'; profile_id: number }
+  | { kind: 'profile_setup'; profile_id: number }
+  | { kind: 'sessions' };
+
+export interface SnapshotResourceEntry {
+  resource: ResourceRef;
+  before: unknown;
+  /**
+   * Identities touched for THIS resource (e.g. library/progress/history keys),
+   * used for precise, truncation-safe undo. Scoped per resource, never global.
+   */
+  scope?: unknown;
+}
+
+export interface Snapshot {
+  id: string;
+  ts: string;
+  tool: string;
+  backend: string;
+  account?: string;
+  /** Set for single-resource snapshots; omitted for composite ones. */
+  resource?: ResourceRef;
+  reversible: boolean;
+  sensitive: boolean;
+  note?: string;
+  /** Identities the mutation touched, used for precise, truncation-safe undo. */
+  scope?: unknown;
+  /** Set for single-resource snapshots; omitted for composite ones. */
+  before?: unknown;
+  /** Set for composite snapshots (e.g. nuvio_apply_plan) covering several resources. */
+  resources?: SnapshotResourceEntry[];
+  composite?: boolean;
+}
+
+/** Normalise a snapshot to its resource entries, regardless of single/composite shape. */
+export function snapshotResources(s: Snapshot): SnapshotResourceEntry[] {
+  if (s.resources && s.resources.length > 0) return s.resources;
+  // Backward compatibility: legacy single-resource snapshots stored `scope` at
+  // the top level. Normalise it onto the resource entry.
+  if (s.resource) return [{ resource: s.resource, before: s.before, scope: s.scope }];
+  return [];
+}
+
+const SNAPSHOT_ID_RE = /^\d{16}-[a-z0-9]{4,16}$/;
+
+function snapshotId(): string {
+  const ms = String(Date.now()).padStart(16, '0');
+  const rand = randomBytes(4).toString('hex');
+  return `${ms}-${rand}`;
+}
+
+/** Resolve a snapshot file path, refusing ids that could escape the snapshot directory. */
+function snapshotFile(cfg: NuvioConfig, id: string): string | null {
+  if (!SNAPSHOT_ID_RE.test(id)) return null;
+  const dir = resolve(cfg.snapshotDir);
+  const target = resolve(join(cfg.snapshotDir, `${id}.json`));
+  if (!target.startsWith(dir + sep)) return null;
+  return target;
+}
+
+function sensitiveKind(kind: ResourceRef['kind']): boolean {
+  return kind === 'provider_credentials' || kind === 'tracker_tokens' || kind === 'profile_setup';
+}
+
+export function capture(
+  cfg: NuvioConfig,
+  client: NuvioClient,
+  input: {
+    tool: string;
+    resource: ResourceRef;
+    before: unknown;
+    reversible?: boolean;
+    note?: string;
+    scope?: unknown;
+  }
+): Snapshot {
+  const snapshot: Snapshot = {
+    id: snapshotId(),
+    ts: new Date().toISOString(),
+    tool: input.tool,
+    backend: cfg.backendUrl,
+    account: client.currentEmail ?? client.currentUserId,
+    resource: input.resource,
+    reversible: input.reversible ?? true,
+    sensitive: sensitiveKind(input.resource.kind),
+    note: input.note,
+    scope: input.scope,
+    before: input.before,
+  };
+  persist(cfg, snapshot);
+  return snapshot;
+}
+
+/** Capture one snapshot covering several resources (used by nuvio_apply_plan). */
+export function captureComposite(
+  cfg: NuvioConfig,
+  client: NuvioClient,
+  input: {
+    tool: string;
+    entries: SnapshotResourceEntry[];
+    reversible?: boolean;
+    note?: string;
+    scope?: unknown;
+  }
+): Snapshot {
+  const snapshot: Snapshot = {
+    id: snapshotId(),
+    ts: new Date().toISOString(),
+    tool: input.tool,
+    backend: cfg.backendUrl,
+    account: client.currentEmail ?? client.currentUserId,
+    reversible: input.reversible ?? true,
+    sensitive: input.entries.some((e) => sensitiveKind(e.resource.kind)),
+    note: input.note,
+    scope: input.scope,
+    resources: input.entries,
+    composite: true,
+  };
+  persist(cfg, snapshot);
+  return snapshot;
+}
+
+/** Atomically write a snapshot (temp file + fsync + rename, 0600). Throws on any failure. */
+function persist(cfg: NuvioConfig, snapshot: Snapshot): void {
+  const target = join(cfg.snapshotDir, `${snapshot.id}.json`);
+  const tmp = `${target}.tmp`;
+  try {
+    mkdirSync(cfg.snapshotDir, { recursive: true, mode: 0o700 });
+    writeFileSync(tmp, JSON.stringify(snapshot, null, 2), { mode: 0o600 });
+    const fd = openSync(tmp, 'r+');
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, target);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* temp file may not exist */
+    }
+    throw new SnapshotError(
+      `Could not persist the pre-change snapshot (${error instanceof Error ? error.message : String(error)}). ` +
+        'The change was not applied.'
+    );
+  }
+  // Best-effort retention. keepLast=1 protects the snapshot just written; the
+  // age/count/size limits still apply to everything else.
+  try {
+    pruneSnapshots(cfg, { keepLast: 1 });
+  } catch {
+    /* retention is best-effort */
+  }
+}
+
+export interface PruneOptions {
+  olderThanDays?: number;
+  /** Newest N snapshots are never removed. Defaults to the configured max count. */
+  keepLast?: number;
+  /** Hard count limit; snapshots beyond it are removed (automatic GC). */
+  maxCount?: number;
+  maxTotalBytes?: number;
+  dryRun?: boolean;
+}
+
+export interface PruneResult {
+  removed: Array<{ id: string; bytes: number; reason: string }>;
+  kept: number;
+  freed_bytes: number;
+}
+
+/** Delete old/large snapshots according to the retention limits. */
+export function pruneSnapshots(cfg: NuvioConfig, options: PruneOptions = {}): PruneResult {
+  // Three independent limits (age, count, size). `keep_last` defaults to 0:
+  // it protects nothing unless a caller explicitly asks for it. Automatic GC
+  // passes keepLast=1 itself so it never deletes the snapshot it just wrote.
+  const olderThanDays = options.olderThanDays ?? cfg.snapshotMaxAgeDays;
+  const keepLast = options.keepLast ?? 0;
+  const maxCount = options.maxCount ?? cfg.snapshotMaxCount;
+  const maxTotalBytes = options.maxTotalBytes ?? cfg.snapshotMaxTotalBytes;
+
+  let files: string[];
+  try {
+    files = readdirSync(cfg.snapshotDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return { removed: [], kept: 0, freed_bytes: 0 };
+  }
+  const entries = files
+    .map((file) => {
+      const id = file.slice(0, -'.json'.length);
+      let size = 0;
+      try {
+        size = statSync(join(cfg.snapshotDir, file)).size;
+      } catch {
+        /* unreadable, treat as empty */
+      }
+      return { id, size };
+    })
+    .sort((a, b) => (a.id < b.id ? 1 : -1)); // newest first
+
+  const cutoff = olderThanDays > 0 ? Date.now() - olderThanDays * 24 * 60 * 60 * 1000 : 0;
+  const removed: PruneResult['removed'] = [];
+  let cumulative = 0;
+  entries.forEach((entry, index) => {
+    // The newest `keepLast` snapshots are always retained (that is the count limit).
+    if (index < keepLast) {
+      cumulative += entry.size;
+      return;
+    }
+    const ts = Number(entry.id.slice(0, 16));
+    const tooOld = cutoff > 0 && Number.isFinite(ts) && ts < cutoff;
+    const tooBig = maxTotalBytes > 0 && cumulative + entry.size > maxTotalBytes;
+    const tooMany = maxCount > 0 && index >= maxCount;
+    if (tooOld || tooBig || tooMany) {
+      removed.push({ id: entry.id, bytes: entry.size, reason: tooOld ? 'age' : tooBig ? 'size' : 'count' });
+    } else {
+      cumulative += entry.size;
+    }
+  });
+
+  if (!options.dryRun) {
+    for (const entry of removed) removeSnapshot(cfg, entry.id);
+  }
+  return {
+    removed,
+    kept: entries.length - removed.length,
+    freed_bytes: removed.reduce((sum, r) => sum + r.bytes, 0),
+  };
+}
+
+export function removeSnapshot(cfg: NuvioConfig, id: string): void {
+  const target = snapshotFile(cfg, id);
+  if (!target) return;
+  try {
+    unlinkSync(target);
+  } catch {
+    /* already gone */
+  }
+}
+
+export function listSnapshots(cfg: NuvioConfig, limit = 25): Snapshot[] {
+  let files: string[];
+  try {
+    files = readdirSync(cfg.snapshotDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return [];
+  }
+  const snapshots: Snapshot[] = [];
+  for (const file of files) {
+    try {
+      snapshots.push(JSON.parse(readFileSync(join(cfg.snapshotDir, file), 'utf8')) as Snapshot);
+    } catch {
+      /* skip corrupt snapshot */
+    }
+  }
+  snapshots.sort((a, b) => (a.id < b.id ? 1 : -1));
+  return snapshots.slice(0, limit);
+}
+
+export function getSnapshot(cfg: NuvioConfig, id: string): Snapshot | null {
+  const target = snapshotFile(cfg, id);
+  if (!target) return null;
+  try {
+    return JSON.parse(readFileSync(target, 'utf8')) as Snapshot;
+  } catch {
+    return null;
+  }
+}
+
+export function findLastChange(cfg: NuvioConfig): Snapshot | null {
+  return listSnapshots(cfg, 500).find((s) => s.reversible && s.tool !== 'nuvio_undo') ?? null;
+}
+
+export function findLastUndo(cfg: NuvioConfig): Snapshot | null {
+  return listSnapshots(cfg, 500).find((s) => s.tool === 'nuvio_undo' && s.reversible) ?? null;
+}
+
+function strip<T extends Record<string, unknown>>(rows: T[], keys: string[]): Array<Record<string, unknown>> {
+  return rows.map((row) => {
+    const out: Record<string, unknown> = {};
+    for (const key of keys) if (row[key] !== undefined) out[key] = row[key];
+    return out;
+  });
+}
+
+const LIBRARY_FIELDS = [
+  'content_id',
+  'content_type',
+  'name',
+  'poster',
+  'poster_shape',
+  'background',
+  'description',
+  'release_info',
+  'imdb_rating',
+  'genres',
+  'addon_base_url',
+  'added_at',
+];
+const PROGRESS_FIELDS = [
+  'content_id',
+  'content_type',
+  'video_id',
+  'season',
+  'episode',
+  'position',
+  'duration',
+  'last_watched',
+  'progress_key',
+];
+const HISTORY_FIELDS = ['content_id', 'content_type', 'title', 'season', 'episode', 'watched_at'];
+
+/**
+ * Read the current state of a resource in the shape `restore` expects. Uses the
+ * cached read RPCs so that, within one CLI invocation, the snapshot read and the ops
+ * read collapse into a single backend request.
+ */
+export async function readResource(client: NuvioClient, ref: ResourceRef): Promise<unknown> {
+  switch (ref.kind) {
+    case 'profiles': {
+      const rows = await client.readRpc<Array<Record<string, unknown>>>('sync_pull_profiles', {});
+      return strip(rows, [
+        'profile_index',
+        'name',
+        'avatar_color_hex',
+        'uses_primary_addons',
+        'uses_primary_plugins',
+        'avatar_id',
+        'avatar_url',
+      ]);
+    }
+    case 'addons': {
+      const rows = await client.select<Array<Record<string, unknown>>>(
+        'addons',
+        `select=id,user_id,profile_id,url,name,enabled,sort_order,created_at,updated_at` +
+          `&profile_id=eq.${ref.profile_id}&order=sort_order.asc,created_at.asc`
+      );
+      return strip(rows, ['url', 'name', 'enabled', 'sort_order']);
+    }
+    case 'plugins': {
+      const rows = await client.select<Array<Record<string, unknown>>>(
+        'plugins',
+        `select=id,user_id,profile_id,url,name,enabled,sort_order,repo_type,created_at,updated_at` +
+          `&profile_id=eq.${ref.profile_id}&order=sort_order.asc`
+      );
+      return strip(rows, ['url', 'name', 'enabled', 'sort_order', 'repo_type']);
+    }
+    case 'settings':
+    case 'home_catalog_settings': {
+      const fn =
+        ref.kind === 'settings' ? 'sync_pull_profile_settings_blob' : 'sync_pull_home_catalog_settings';
+      const rows = await client.readRpc<Array<{ settings_json: unknown }>>(fn, {
+        p_profile_id: ref.profile_id,
+        p_platform: ref.platform,
+      });
+      return rows[0]?.settings_json ?? {};
+    }
+    case 'collections': {
+      const rows = await client.readRpc<Array<{ collections_json: unknown }>>('sync_pull_collections', {
+        p_profile_id: ref.profile_id,
+      });
+      return rows[0]?.collections_json ?? [];
+    }
+    case 'library':
+      return readAllLibrary(client, ref.profile_id);
+    case 'watch_progress':
+      // Progress has no pagination contract; refuse a snapshot we cannot prove complete.
+      return readAllWatchProgress(client, ref.profile_id, { requireComplete: true });
+    case 'watch_history':
+      return readAllWatchHistory(client, ref.profile_id);
+    case 'provider_credentials':
+      return client.readRpc('sync_pull_provider_credentials', { p_profile_id: ref.profile_id });
+    case 'tracker_tokens':
+      return client.readRpc('get_tracker_tokens', { p_profile_id: ref.profile_id });
+    case 'tracker_settings':
+      return client.readRpc('get_profile_tracker_settings', { p_profile_id: ref.profile_id });
+    case 'profile_setup': {
+      const settings: Record<string, unknown> = {};
+      for (const platform of ['tv', 'mobile', 'desktop']) {
+        const rows = await client.readRpc<Array<{ settings_json: unknown }>>(
+          'sync_pull_profile_settings_blob',
+          { p_profile_id: ref.profile_id, p_platform: platform }
+        );
+        settings[platform] = rows[0]?.settings_json ?? null;
+      }
+      const providerCredentials = await client.readRpc('sync_pull_provider_credentials', {
+        p_profile_id: ref.profile_id,
+      });
+      return { settings, provider_credentials: providerCredentials };
+    }
+    default:
+      throw new NuvioError('This resource cannot be read for snapshotting.');
+  }
+}
+
+export interface RestoreOutcome {
+  resource: string;
+  profile_id?: number;
+  platform?: string;
+  ok: boolean;
+  message: string;
+}
+
+export interface RestoreReport {
+  ok: boolean;
+  outcomes: RestoreOutcome[];
+}
+
+function outcomeOf(entry: SnapshotResourceEntry, ok: boolean, message: string): RestoreOutcome {
+  const r = entry.resource as { kind: string; profile_id?: number; platform?: string };
+  return { resource: r.kind, profile_id: r.profile_id, platform: r.platform, ok, message };
+}
+
+/**
+ * Restore the state captured by a snapshot. Works for single and composite
+ * snapshots and reports every resource individually — a partial rollback is
+ * never hidden.
+ */
+export async function restore(
+  client: NuvioClient,
+  cfg: NuvioConfig,
+  snapshot: Snapshot
+): Promise<RestoreReport> {
+  if (!snapshot.reversible) {
+    throw new NuvioError(`Snapshot ${snapshot.id} (${snapshot.tool}) cannot be reverted automatically.`);
+  }
+  const entries = snapshotResources(snapshot);
+  if (entries.length === 0) throw new NuvioError(`Snapshot ${snapshot.id} has no resources to restore.`);
+  const outcomes: RestoreOutcome[] = [];
+  for (const entry of entries) {
+    try {
+      const message = await restoreResource(client, cfg, entry, snapshot);
+      outcomes.push(outcomeOf(entry, true, message));
+    } catch (error) {
+      outcomes.push(outcomeOf(entry, false, error instanceof Error ? error.message : String(error)));
+    }
+  }
+  return { ok: outcomes.every((o) => o.ok), outcomes };
+}
+
+export async function restoreResource(
+  client: NuvioClient,
+  cfg: NuvioConfig,
+  entry: SnapshotResourceEntry,
+  snapshot: Snapshot
+): Promise<string> {
+  if (!snapshot.reversible) {
+    throw new NuvioError(`Snapshot ${snapshot.id} (${snapshot.tool}) cannot be reverted automatically.`);
+  }
+  const origin = cfg.originClientId;
+  const r = entry.resource;
+  const before = entry.before;
+
+  switch (r.kind) {
+    case 'profiles': {
+      const wanted = new Set((before as Array<{ profile_index: number }>).map((p) => p.profile_index));
+      const current = await client.rpc<Array<{ profile_index: number }>>('sync_pull_profiles', {});
+      for (const p of current) {
+        if (!wanted.has(p.profile_index)) {
+          await client.rpc('sync_delete_profile_data', {
+            p_profile_id: p.profile_index,
+            p_origin_client_id: origin,
+          });
+        }
+      }
+      await client.rpc('sync_push_profiles', {
+        p_client_max_profiles: 6,
+        p_origin_client_id: origin,
+        p_profiles: before,
+      });
+      return 'Restored the profile list.';
+    }
+    case 'addons':
+      await client.rpc('sync_push_addons', {
+        p_profile_id: r.profile_id,
+        p_addons: before,
+        p_origin_client_id: origin,
+      });
+      return `Restored addons for profile ${r.profile_id}.`;
+    case 'plugins':
+      await client.rpc('sync_push_plugins', {
+        p_profile_id: r.profile_id,
+        p_plugins: before,
+        p_origin_client_id: origin,
+      });
+      return `Restored plugins for profile ${r.profile_id}.`;
+    case 'settings':
+      await client.rpc('sync_push_profile_settings_blob', {
+        p_profile_id: r.profile_id,
+        p_platform: r.platform,
+        p_settings_json: before,
+        p_origin_client_id: origin,
+      });
+      return `Restored ${r.platform} settings for profile ${r.profile_id}.`;
+    case 'home_catalog_settings':
+      await client.rpc('sync_push_home_catalog_settings', {
+        p_profile_id: r.profile_id,
+        p_platform: r.platform,
+        p_settings_json: before,
+        p_origin_client_id: origin,
+      });
+      return `Restored ${r.platform} home catalog settings for profile ${r.profile_id}.`;
+    case 'collections':
+      await client.rpc('sync_push_collections', {
+        p_profile_id: r.profile_id,
+        p_collections_json: before,
+        p_origin_client_id: origin,
+      });
+      return `Restored collections for profile ${r.profile_id}.`;
+    case 'library': {
+      const beforeRows = before as Array<Record<string, unknown>>;
+      const scope = entry.scope as Array<{ content_id: string; content_type: string }> | undefined;
+      const beforeKeys = new Set(beforeRows.map((i) => libraryKeyOf(i as never)));
+      if (scope === undefined) {
+        // Legacy snapshot without scope: restore the whole resource.
+        if (beforeRows.length > 0) {
+          await client.rpc('sync_push_library_items', {
+            p_profile_id: r.profile_id,
+            p_items: strip(beforeRows, LIBRARY_FIELDS),
+            p_origin_client_id: origin,
+          });
+        }
+        return `Restored the library for profile ${r.profile_id}.`;
+      }
+      const scopeKeys = new Set(scope.map((k) => libraryKeyOf(k)));
+      const scopedBefore = beforeRows.filter((i) => scopeKeys.has(libraryKeyOf(i as never)));
+      const remove = scope.filter((k) => !beforeKeys.has(libraryKeyOf(k)));
+      if (remove.length > 0) {
+        await client.rpc('sync_delete_library_items', {
+          p_profile_id: r.profile_id,
+          p_keys: remove,
+          p_origin_client_id: origin,
+        });
+      }
+      if (scopedBefore.length > 0) {
+        await client.rpc('sync_push_library_items', {
+          p_profile_id: r.profile_id,
+          p_items: strip(scopedBefore, LIBRARY_FIELDS),
+          p_origin_client_id: origin,
+        });
+      }
+      return `Restored the library for profile ${r.profile_id} (${scopedBefore.length} scoped item(s)).`;
+    }
+    case 'watch_progress': {
+      const beforeRows = before as Array<Record<string, unknown>>;
+      const scope = entry.scope as string[] | undefined;
+      const beforeKeys = new Set(beforeRows.map((p) => storedProgressKey(p)));
+      if (scope === undefined) {
+        if (beforeRows.length > 0) {
+          await client.rpc('sync_push_watch_progress', {
+            p_profile_id: r.profile_id,
+            p_entries: strip(beforeRows, PROGRESS_FIELDS),
+            p_origin_client_id: origin,
+          });
+        }
+        return `Restored watch progress for profile ${r.profile_id}.`;
+      }
+      const scopeKeys = new Set(scope);
+      const scopedBefore = beforeRows.filter((p) => scopeKeys.has(storedProgressKey(p)));
+      const remove = scope.filter((key) => !beforeKeys.has(key));
+      if (remove.length > 0) {
+        await client.rpc('sync_delete_watch_progress', {
+          p_profile_id: r.profile_id,
+          p_keys: remove,
+          p_origin_client_id: origin,
+        });
+      }
+      if (scopedBefore.length > 0) {
+        await client.rpc('sync_push_watch_progress', {
+          p_profile_id: r.profile_id,
+          p_entries: strip(scopedBefore, PROGRESS_FIELDS),
+          p_origin_client_id: origin,
+        });
+      }
+      return `Restored watch progress for profile ${r.profile_id} (${scopedBefore.length} scoped entry(ies)).`;
+    }
+    case 'watch_history': {
+      const beforeRows = before as Array<Record<string, unknown>>;
+      const scope = entry.scope as Array<Record<string, unknown>> | undefined;
+      const beforeKeys = new Set(beforeRows.map((i) => historyKeyOf(i as never)));
+      if (scope === undefined) {
+        if (beforeRows.length > 0) {
+          await client.rpc('sync_push_watched_items', {
+            p_profile_id: r.profile_id,
+            p_items: strip(beforeRows, HISTORY_FIELDS),
+            p_origin_client_id: origin,
+          });
+        }
+        return `Restored watch history for profile ${r.profile_id}.`;
+      }
+      const scopeKeys = new Set(scope.map((k) => historyKeyOf(k as never)));
+      const scopedBefore = beforeRows.filter((i) => scopeKeys.has(historyKeyOf(i as never)));
+      const remove = scope.filter((k) => !beforeKeys.has(historyKeyOf(k as never)));
+      if (remove.length > 0) {
+        await client.rpc('sync_delete_watched_items', {
+          p_profile_id: r.profile_id,
+          p_keys: remove.map((i) => ({
+            content_id: i.content_id,
+            season: i.season ?? null,
+            episode: i.episode ?? null,
+          })),
+          p_origin_client_id: origin,
+        });
+      }
+      if (scopedBefore.length > 0) {
+        await client.rpc('sync_push_watched_items', {
+          p_profile_id: r.profile_id,
+          p_items: strip(scopedBefore, HISTORY_FIELDS),
+          p_origin_client_id: origin,
+        });
+      }
+      return `Restored watch history for profile ${r.profile_id} (${scopedBefore.length} scoped item(s)).`;
+    }
+    case 'provider_credentials': {
+      const current = await client.rpc<Array<{ provider: string }>>('sync_pull_provider_credentials', {
+        p_profile_id: r.profile_id,
+      });
+      const beforeRows = before as Array<{ provider: string; credential_json: unknown }>;
+      const wanted = new Set(beforeRows.map((c) => c.provider));
+      for (const cred of current) {
+        if (!wanted.has(cred.provider)) {
+          await client.rpc('sync_delete_provider_credentials', {
+            p_profile_id: r.profile_id,
+            p_provider: cred.provider,
+            p_origin_client_id: origin,
+          });
+        }
+      }
+      if (beforeRows.length > 0) {
+        await client.rpc('sync_push_provider_credentials', {
+          p_profile_id: r.profile_id,
+          p_credentials: beforeRows.map((c) => ({
+            provider: c.provider,
+            credential_json: c.credential_json,
+          })),
+          p_origin_client_id: origin,
+        });
+      }
+      return `Restored provider credentials for profile ${r.profile_id}.`;
+    }
+    case 'tracker_tokens': {
+      const current = await client.rpc<Array<{ tracker: string }>>('get_tracker_tokens', {
+        p_profile_id: r.profile_id,
+      });
+      const beforeRows = before as Array<Record<string, unknown>>;
+      const wanted = new Set(beforeRows.map((t) => String(t.tracker)));
+      for (const token of current) {
+        if (!wanted.has(String(token.tracker))) {
+          await client.rpc('clear_tracker_tokens', { p_profile_id: r.profile_id, p_tracker: token.tracker });
+        }
+      }
+      for (const token of beforeRows) {
+        await client.rpc('upsert_tracker_tokens', {
+          p_profile_id: r.profile_id,
+          p_tracker: token.tracker,
+          p_access_token: token.access_token,
+          p_refresh_token: token.refresh_token ?? '',
+          p_expires_in_seconds: secondsUntil(token.expires_at),
+          p_tracker_user_id: token.tracker_user_id ?? '',
+          p_username: token.tracker_username ?? token.username ?? '',
+        });
+      }
+      return `Restored tracker links for profile ${r.profile_id}.`;
+    }
+    case 'tracker_settings': {
+      const beforeRows = before as Array<Record<string, unknown>>;
+      const wanted = new Set(beforeRows.map((row) => String(row.tracker)));
+      const current = await client.rpc<Array<{ tracker: string }>>('get_profile_tracker_settings', {
+        p_profile_id: r.profile_id,
+      });
+      for (const row of current) {
+        if (!wanted.has(String(row.tracker))) {
+          await client.rpc('upsert_profile_tracker_settings', {
+            p_profile_id: r.profile_id,
+            p_tracker: row.tracker,
+            p_enabled_statuses: [],
+            p_row_order: [],
+            p_send_progress: true,
+          });
+        }
+      }
+      for (const row of beforeRows) {
+        await client.rpc('upsert_profile_tracker_settings', {
+          p_profile_id: r.profile_id,
+          p_tracker: row.tracker,
+          p_enabled_statuses: row.enabled_statuses ?? [],
+          p_row_order: row.row_order ?? [],
+          p_send_progress: row.send_progress ?? true,
+        });
+      }
+      return `Restored tracker settings for profile ${r.profile_id}.`;
+    }
+    case 'profile_setup': {
+      const data = before as {
+        settings: Record<string, unknown | null>;
+        provider_credentials: Array<{ provider: string; credential_json: unknown }>;
+      };
+      for (const [platform, json] of Object.entries(data.settings ?? {})) {
+        if (json === null || json === undefined) continue;
+        await client.rpc('sync_push_profile_settings_blob', {
+          p_profile_id: r.profile_id,
+          p_platform: platform,
+          p_settings_json: json,
+          p_origin_client_id: origin,
+        });
+      }
+      const wanted = new Set((data.provider_credentials ?? []).map((c) => c.provider));
+      const current = await client.rpc<Array<{ provider: string }>>('sync_pull_provider_credentials', {
+        p_profile_id: r.profile_id,
+      });
+      for (const cred of current) {
+        if (!wanted.has(cred.provider)) {
+          await client.rpc('sync_delete_provider_credentials', {
+            p_profile_id: r.profile_id,
+            p_provider: cred.provider,
+            p_origin_client_id: origin,
+          });
+        }
+      }
+      if ((data.provider_credentials ?? []).length > 0) {
+        await client.rpc('sync_push_provider_credentials', {
+          p_profile_id: r.profile_id,
+          p_credentials: data.provider_credentials.map((c) => ({
+            provider: c.provider,
+            credential_json: c.credential_json,
+          })),
+          p_origin_client_id: origin,
+        });
+      }
+      return `Restored setup for profile ${r.profile_id}.`;
+    }
+    default:
+      throw new NuvioError(`No automatic revert available for resource "${(r as ResourceRef).kind}".`);
+  }
+}
+
+function secondsUntil(expiresAt: unknown): number {
+  const ts = typeof expiresAt === 'string' ? Date.parse(expiresAt) : NaN;
+  if (Number.isNaN(ts)) return 3600;
+  return Math.max(60, Math.floor((ts - Date.now()) / 1000));
+}
+
+export function describe(s: Snapshot): string {
+  const entries = snapshotResources(s);
+  const where = s.composite
+    ? ` ${entries.length} resources [${[...new Set(entries.map((e) => e.resource.kind))].join(', ')}]`
+    : (() => {
+        const r = entries[0]?.resource as
+          { kind?: string; profile_id?: number; platform?: string } | undefined;
+        if (!r) return '';
+        const target = r.profile_id !== undefined ? ` profile ${r.profile_id}` : '';
+        const platform = r.platform ? `/${r.platform}` : '';
+        return ` -> ${r.kind}${target}${platform}`;
+      })();
+  const flags =
+    (s.reversible ? '' : ' [not reversible]') +
+    (s.sensitive ? ' [sensitive]' : '') +
+    (s.note ? ` — ${s.note}` : '');
+  return `${s.id}  ${s.ts}  ${s.tool}${where}${flags}`;
+}
