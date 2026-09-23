@@ -13,6 +13,7 @@
 
   <p>
     <a href="https://github.com/onpeek/nuvio/actions/workflows/ci.yml"><img src="https://github.com/onpeek/nuvio/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <a href="https://www.npmjs.com/package/@onpeek/nuvio"><img src="https://img.shields.io/npm/v/@onpeek/nuvio?style=flat&color=cb3837&logo=npm&logoColor=white" alt="npm version" /></a>
     <img src="https://img.shields.io/badge/node-%3E%3D20-339933?style=flat&logo=node.js&logoColor=white" alt="Node.js 20 or newer" />
     <a href="LICENSE"><img src="https://img.shields.io/github/license/onpeek/nuvio?style=flat&color=6366f1" alt="MIT license" /></a>
   </p>
