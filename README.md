@@ -36,12 +36,14 @@
 ## Install
 
 ```bash
-git clone https://github.com/onpeek/nuvio.git
-cd nuvio
-npm ci
-npm run build
-npm link
+npm install -g @onpeek/nuvio
 npx skills add onpeek/nuvio --skill nuvio
+```
+
+To run a single command without a global install:
+
+```bash
+npx --yes --package=@onpeek/nuvio nuvio commands
 ```
 
 Set <code>NUVIO_EMAIL</code> and <code>NUVIO_PASSWORD</code>, or set
@@ -75,6 +77,8 @@ a full result. See [SECURITY.md](SECURITY.md) for local data and confirmation de
 ## Development
 
 ```bash
+git clone https://github.com/onpeek/nuvio.git
+cd nuvio
 npm ci
 npm run typecheck
 npm run lint
