@@ -1,6 +1,6 @@
 import type { NuvioClient } from '../client.js';
 import type { ApplyResult, HomeCatalogSettings, Platform, SettingsBlob } from '../types.js';
-import { setPath, unsetPath, getPath } from '../paths.js';
+import { setPath, unsetPath } from '../paths.js';
 
 const UNSAFE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
@@ -202,28 +202,6 @@ export async function updateHomeCatalogSettings(
   }
   return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
 }
-
-/** Replace the target's settings blob with a copy of the source's (deprecated copy_settings path). */
-export async function copySettings(
-  client: NuvioClient,
-  from: { profile_id: number; platform: Platform },
-  to: { profile_id: number; platform: Platform },
-  originId: string,
-  apply: boolean
-): Promise<ApplyResult<Record<string, unknown>>> {
-  const source = await getSettings(client, from.profile_id, from.platform);
-  const target = await getSettings(client, to.profile_id, to.platform);
-  const before = target?.settings_json ?? {};
-  const after = clone(source?.settings_json ?? {});
-  const diff = diffTree(before, after);
-  if (apply && diff.length > 0) {
-    await writeSettings(client, to.profile_id, to.platform, after, target?.updated_at ?? null, originId);
-  }
-  return { applied: apply && diff.length > 0, changed: diff.length > 0, before, after, diff };
-}
-
-// Re-exported for the deprecated single-key aliases.
-export { getPath };
 
 function isMissingFunction(error: unknown): boolean {
   const e = error as { code?: string; status?: number };

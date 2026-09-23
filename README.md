@@ -1,59 +1,83 @@
-# Nuvio CLI
+<div align="center">
 
-Manage your Nuvio account from a terminal or a coding agent. This is an unofficial community project, not affiliated with Nuvio.
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/nuvio-wordmark-dark.png" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/nuvio-wordmark-light.png" />
+    <img src="assets/nuvio-wordmark-light.png" alt="Nuvio CLI" width="400" />
+  </picture>
 
-The package provides one CLI and a small agent skill. Commands are discovered on demand, so an agent does not need the complete command catalogue in its context.
+  <p>
+    <strong>Manage your Nuvio account from a terminal or coding agent.</strong><br />
+    Profiles · Addons · Plugins · Settings · Collections · Library · Providers · Trackers
+  </p>
+
+  <p>
+    <a href="https://github.com/onpeek/nuvio/actions/workflows/ci.yml"><img src="https://github.com/onpeek/nuvio/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <img src="https://img.shields.io/badge/node-%3E%3D20-339933?style=flat&logo=node.js&logoColor=white" alt="Node.js 20 or newer" />
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/onpeek/nuvio?style=flat&color=6366f1" alt="MIT license" /></a>
+  </p>
+
+  <p><em>Unofficial community project. Not affiliated with or endorsed by Nuvio.</em></p>
+
+</div>
+
+---
+
+## Features
+
+- 64 commands, discovered on demand with <code>nuvio commands</code> and <code>nuvio help</code>
+- Manage profiles, addons, plugins, settings, collections, library, watch history, providers, and trackers
+- Preview changes, keep snapshots, and undo reversible writes
+- Confirm irreversible operations with a short-lived token
+- Save large results to a file instead of filling agent context
+- Requires Node.js 20 or newer.
 
 ## Install
 
-Requires Node.js 20 or newer. The intended npm package is @onpeek/nuvio:
+```bash
+git clone https://github.com/onpeek/nuvio.git
+cd nuvio
+npm ci
+npm run build
+npm link
+npx skills add onpeek/nuvio --skill nuvio
+```
 
-    npm install -g @onpeek/nuvio
+Set <code>NUVIO_EMAIL</code> and <code>NUVIO_PASSWORD</code>, or set
+<code>NUVIO_REFRESH_TOKEN</code>. The CLI stores its session locally. Use
+<code>NUVIO_BACKEND_URL</code> for a self-hosted backend.
 
-Install the agent skill from the GitHub repository after it is published:
+## Use
 
-    npx skills add onpeek/nuvio --skill nuvio
+```bash
+nuvio commands profile
+nuvio help update-settings
+nuvio list-profiles
+nuvio list-addons --profile-id 1
+```
 
-From source:
+Pass simple values as flags. For arrays, objects, PINs, or provider keys, use
+<code>--input FILE</code> or <code>--input -</code> with JSON. Keep credentials
+and secrets out of shell arguments.
 
-    npm ci
-    npm run build
-    node dist/index.js help
+Preview a change, then apply it:
 
-## Authenticate
+```bash
+nuvio update-settings --input settings-edit.json --dry-run
+nuvio update-settings --input settings-edit.json
+nuvio undo --snapshot-id SNAPSHOT_ID
+```
 
-Set NUVIO_EMAIL and NUVIO_PASSWORD in the environment, or set NUVIO_REFRESH_TOKEN. The CLI saves a session under NUVIO_DATA_DIR (default: ~/.local/share/nuvio). Use NUVIO_BACKEND_URL for a self-hosted backend.
+Normal stdout is capped at 12,000 bytes. Use <code>--output FILE</code> to save
+a full result. See [SECURITY.md](SECURITY.md) for local data and confirmation details.
 
-Do not pass passwords, PINs, API keys, or backup contents as shell arguments. Use environment variables for account credentials and --input FILE or --input - for sensitive command input.
+## Development
 
-## Discover commands
+```bash
+npm ci
+npm run typecheck
+npm run lint
+npm test
+```
 
-    nuvio commands profile
-    nuvio help update-settings
-    nuvio list-profiles
-    nuvio list-addons --profile-id 1
-
-Commands accept simple values as --kebab-case flags. Arrays, objects, and sensitive values can be supplied as one JSON object with --input FILE or --input -. The file and flags are validated against the command schema. All normal output is JSON on stdout; errors are JSON on stderr with a nonzero exit code.
-
-## Change data
-
-    nuvio update-settings --input settings-edit.json --dry-run
-    nuvio update-settings --input settings-edit.json
-
-Reversible writes create a local snapshot. Destructive reversible commands return a preview until --confirm is supplied. Irreversible commands first return a single-use confirmation token that expires after five minutes; repeat the same command with --confirmation-token TOKEN to apply it. Use nuvio list-undo, nuvio undo, and nuvio redo for reversible changes.
-
-The apply-plan command previews by default and supports --apply after review. Use nuvio plan-operations to see supported commands. A plan file contains an operations array; each entry has a hyphenated tool name and an args object. Run nuvio help apply-plan for its input structure.
-
-## Large results
-
-Normal stdout is capped at 12 KB to protect an agent's context. Save a full result to a new file with --output FILE:
-
-    nuvio export-backup --output backup.json
-
-The CLI prints only the path and byte count when saving a file. Files are created with mode 0600 and are never overwritten. The saved result is still masked for known secret fields. The backend excludes credentials from account backups.
-
-## Capabilities
-
-Profiles, addons, plugins, settings, home catalog settings, collections, library, watch progress and history, provider credentials, trackers, sessions, account backup, snapshots, undo, and multi-step plans.
-
-See SECURITY.md for local data and safety details. See LICENSE for the MIT license and original copyright notice.
+[MIT](LICENSE)

@@ -2,11 +2,11 @@
 
 ## Reporting
 
-Use a private security advisory in the onpeek/nuvio GitHub repository once it is published.
+Report vulnerabilities through the private vulnerability reporting feature in the onpeek/nuvio GitHub repository.
 
 ## Local data
 
-The CLI uses NUVIO_DATA_DIR, defaulting to ~/.local/share/nuvio. The session file contains a refresh token. Snapshot files may contain prior provider credentials or tracker tokens so undo can restore them. Session and snapshot files are written with mode 0600; data directories use mode 0700. The audit log masks known secret fields.
+The CLI uses NUVIO_DATA_DIR when set; otherwise it uses $XDG_DATA_HOME/nuvio or ~/.local/share/nuvio. The session file contains a refresh token. Snapshot files may contain prior provider credentials or tracker tokens so undo can restore them. The CLI requests mode 0600 for files and 0700 for data directories. File permission enforcement depends on the operating system. The audit log masks known secret fields.
 
 Set NUVIO_DISABLE_SNAPSHOTS=true if raw prior credentials must not be stored. Undo will then be unavailable for new changes. Protect the data directory and any files written with --output.
 

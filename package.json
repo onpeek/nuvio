@@ -25,7 +25,8 @@
   },
   "files": [
     "dist",
-    "skills/nuvio"
+    "skills/nuvio",
+    "assets"
   ],
   "engines": {
     "node": ">=20"
